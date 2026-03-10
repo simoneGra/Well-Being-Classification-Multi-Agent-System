@@ -211,13 +211,68 @@ Mobility thresholds (radius of gyration):
 
 ### Agent 4 — WellbeingAnalysisAgent
 
-Single batched LLM call classifying all evaluation citizens at once. Token-optimized.
+The only agent that can call an LLM. Designed to minimize token usage while preserving accuracy.
 
 - **Model**: `stepfun/step-3.5-flash:free` via OpenRouter (reasoning model)
-- **Temperature**: 0.1 (deterministic output)
-- **Max tokens**: 4000 (reasoning models need buffer for chain-of-thought)
-- **Prompt**: Training citizens used as calibration examples; LLM returns JSON `{cid: 0|1}`
+- **Temperature**: 0.1 (near-deterministic output)
+- **Max tokens**: 4000 (reasoning models consume tokens for internal chain-of-thought before producing output)
 - **Fallback**: Rule-based predictions used if LLM response is empty or unparseable
+
+---
+
+### When and How the LLM Is Called
+
+The LLM is **only called when the rule-based score cannot confidently decide** the outcome. Every citizen is first scored by the `FeatureEngineerAgent` on a 0–100 scale using pure Python statistics (no LLM cost). The result falls into one of three zones:
+
+```
+Rule score:   0 ────────── 20 ─────────────── 65 ──────────── 100
+                   SAFE zone    AMBIGUOUS zone     RISK zone
+              label=0, no LLM   ← LLM called →   label=1, no LLM
+```
+
+| Zone | Condition | Action | Tokens used |
+|------|-----------|--------|-------------|
+| Confident safe | `rule_score ≤ 20` | Label = 0 immediately | **0** |
+| Ambiguous | `20 < rule_score < 65` | Single batched LLM call for all ambiguous citizens | Input + output tokens |
+| Confident risk | `rule_score ≥ 65` | Label = 1 immediately | **0** |
+
+**In practice, both Level 1 and Level 2 had all citizens outside the ambiguous zone → 0 LLM tokens used.**
+
+#### What the LLM receives (when called)
+
+Only the ambiguous citizens are included — no training examples, no mobility data. The prompt format is intentionally minimal:
+
+```
+[CITIZENID] esc=N(event_types) pai_slope=X sqi_slope=Y eel=Z(slope=W) score=S | health=... | social=...
+Classify [CITIZENID, ...] → JSON only
+```
+
+- `esc` = number and types of escalated care events (strongest risk signal)
+- `pai_slope` / `sqi_slope` = trend direction of physical activity and sleep quality
+- `eel` + `slope` = current environmental exposure and its trajectory
+- `health` / `social` = two-line persona summary extracted from the persona file
+- The full training dataset is **not included** — the system prompt encodes the classification rule directly
+
+#### LLM call decision tree
+
+```
+For each evaluation citizen:
+  │
+  ├─ rule_score ≥ 65? ──→ label=1 (skip LLM)
+  │
+  ├─ rule_score ≤ 20? ──→ label=0 (skip LLM)
+  │
+  └─ ambiguous (20–65)?
+        │
+        └─ collect all ambiguous citizens
+              │
+              ├─ none? ──→ return all rule-based results (0 tokens)
+              │
+              └─ some? ──→ one batched LLM call with minimal prompt
+                                │
+                                ├─ parse JSON response → {cid: 0|1}
+                                └─ fallback to rule_prediction if parse fails
+```
 
 ---
 
@@ -231,6 +286,37 @@ elif rule_score <= 10:
 else:
     prediction = llm_prediction  # LLM gets the vote (nuanced cases)
 ```
+
+---
+
+### Further Optimizations: How to Reduce Tokens, Latency, and Cost
+
+#### Input tokens
+
+| Technique | Saving | Notes |
+|-----------|--------|-------|
+| **Current: skip LLM when no ambiguous citizens** | 100% | Already implemented. Zero tokens when all rule scores are extreme. |
+| Widen the confidence bands | Reduces ambiguous pool | Raise `CONFIDENT_SAFE_THRESHOLD` (e.g. 25→30) or lower `CONFIDENT_RISK_THRESHOLD` (e.g. 65→55) if the rule score proves reliable across more levels. |
+| Drop persona text from prompt | ~30–40% of prompt tokens | If the feature signals (escalated events, slopes) are already sufficient, the `health=` / `social=` lines add cost without changing the result. |
+| Abbreviate feature keys | ~10–15% | Replace `pai_slope=` with `ps=`, `eel=` with `e=`, etc. Minimal readability cost. |
+| Remove training examples | Already done | The current prompt does not include training citizens; the rule is encoded in the system prompt instead. |
+
+#### Output tokens
+
+| Technique | Saving | Notes |
+|-----------|--------|-------|
+| **Constrain response format** | Large | The current system prompt asks for compact JSON `{"ID":0,...}`. Tighter instruction (e.g. "respond with space-separated 0/1 values in the same order") removes JSON key overhead. |
+| Reduce max_tokens | Moderate | `MAX_TOKENS=4000` is a ceiling, not a guarantee. For the reasoning model, the actual output is small (~30 tokens) — the rest is internal reasoning. Cannot be reduced without risking truncation. |
+| Switch to a non-reasoning model | Large | A standard instruction-tuned model (e.g. `mistralai/mistral-7b-instruct:free`) does not use reasoning tokens, so `max_tokens=200` is sufficient. Saves ~400–500 tokens per call. Trade-off: may be less accurate on edge cases. |
+
+#### Latency
+
+| Technique | Impact | Notes |
+|-----------|--------|-------|
+| **Current: skip LLM when no ambiguous cases** | Eliminates LLM latency entirely (~14s → ~0.01s) | Already implemented. |
+| Agents 1–3 run sequentially | Minor | DataLoader, FeatureEngineer, and MobilityAnalyzer are all fast pure-Python steps. Could be parallelized for very large datasets (e.g., run mobility analysis concurrently with feature engineering). |
+| Cache feature results | Useful for repeated runs | Pickle `CitizenFeatures` per dataset after first computation; skip re-computation on subsequent runs with the same data. |
+| Use a faster model | Large | Models with lower TTFT (time to first token) on OpenRouter reduce wall-clock time when LLM is needed. `stepfun/step-3.5-flash` is already optimized; alternatives: `google/gemma-3-4b-it:free` or `meta-llama/llama-3.2-3b-instruct:free`. |
 
 ---
 
