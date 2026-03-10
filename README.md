@@ -65,8 +65,7 @@ LANGFUSE_PUBLIC_KEY=pk-lf-...
 LANGFUSE_SECRET_KEY=sk-lf-...
 LANGFUSE_HOST=https://challenges.reply.com/langfuse
 TEAM_NAME=project-demo
-TRAIN_FOLDER=public_lev_1        # Folder inside data/training/ to use as training data
-EVAL_FOLDER=public_lev_1_ev      # Folder inside data/evaluation/ to evaluate
+DATA_FOLDER=public_lev_1_ev      # Folder to evaluate (searched in data/training/ then data/evaluation/)
 ```
 
 ### 3. Run
@@ -76,24 +75,21 @@ cd solution
 python3 main.py
 ```
 
-The output file is written to `output/predictions_<EVAL_FOLDER>.txt`.
+The output file is written to `output/predictions_<DATA_FOLDER>.txt`.
 
 ---
 
 ## Switching Datasets
 
-To use different datasets, set `TRAIN_FOLDER` and/or `EVAL_FOLDER` in `.env`:
+Set `DATA_FOLDER` in `.env` to the name of the folder you want to evaluate:
 
 ```env
-TRAIN_FOLDER=public_lev_1       # Folder under data/training/
-EVAL_FOLDER=public_lev_1_ev     # Folder under data/evaluation/
-
-# Level 2 example (when available):
-TRAIN_FOLDER=public_lev_2
-EVAL_FOLDER=public_lev_2_ev
+DATA_FOLDER=public_lev_1        # Self-check on training data
+DATA_FOLDER=public_lev_1_ev     # Level 1 evaluation
+DATA_FOLDER=public_lev_2_ev     # Level 2 evaluation (when available)
 ```
 
-Place training datasets inside `data/training/` and evaluation datasets inside `data/evaluation/`, then point the env vars to the subfolder name.
+The system automatically looks for the folder in `data/training/` first, then `data/evaluation/`. Place new datasets in the appropriate subdirectory and update `DATA_FOLDER`.
 
 ---
 
