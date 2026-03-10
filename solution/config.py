@@ -17,8 +17,12 @@ TEMPERATURE = 0.1  # Low temperature for deterministic classification
 MAX_TOKENS = 4000  # Reasoning model needs extra budget for chain-of-thought before output
 
 DATA_DIR = BASE_DIR / "data"
-TRAIN_DIR = DATA_DIR / "training" / os.getenv("TRAIN_FOLDER", "public_lev_1")
-EVAL_DIR = DATA_DIR / "evaluation" / os.getenv("EVAL_FOLDER", "public_lev_1_ev")
+TRAIN_DIR = DATA_DIR / "training" / "public_lev_1"
+
+_data_folder = os.getenv("DATA_FOLDER", "public_lev_1_ev")
+_in_training = DATA_DIR / "training" / _data_folder
+_in_evaluation = DATA_DIR / "evaluation" / _data_folder
+EVAL_DIR = _in_training if _in_training.exists() else _in_evaluation
 OUTPUT_DIR = BASE_DIR / "output"
 
 # High-risk event types (signals escalating care needs)
