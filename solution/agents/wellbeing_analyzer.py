@@ -1,84 +1,130 @@
 """
 WellbeingAnalysisAgent: LLM-based analysis of citizen wellbeing.
 
-Performs a SINGLE batched LLM call covering all evaluation citizens at once.
-The LLM receives:
-  - Training citizens' condensed feature summaries + key persona signals
-  - Evaluation citizens' condensed feature summaries + key persona signals
-  - Instruction to classify each evaluation citizen as 0 or 1
+Token optimization strategy:
+  - Citizens with rule_score >= CONFIDENT_RISK_THRESHOLD  → label=1 without LLM
+  - Citizens with rule_score <= CONFIDENT_SAFE_THRESHOLD  → label=0 without LLM
+  - Only ambiguous citizens (scores in between) → single batched LLM call
+  - No training examples in LLM prompt (rule description in system prompt instead)
+  - Minimal feature representation: only the 3 most discriminating signals
 
-Token efficiency: one call per run, batch all citizens.
+Result: 0 tokens when all citizens are clearly classified, otherwise minimal usage.
 Tracked via Langfuse v3.
 """
 import json
 import re
-from typing import Dict, Optional
+from typing import Dict, List, Tuple
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 
-from agents.feature_engineer import CitizenFeatures, FeatureEngineerAgent
-from agents.mobility_analyzer import MobilityFeatures, MobilityAnalysisAgent
-from config import OPENROUTER_API_KEY, BASE_URL, MODEL_ID, TEMPERATURE, MAX_TOKENS
+from agents.feature_engineer import CitizenFeatures
+from config import (
+    OPENROUTER_API_KEY, BASE_URL, MODEL_ID, TEMPERATURE, MAX_TOKENS,
+    CONFIDENT_RISK_THRESHOLD, CONFIDENT_SAFE_THRESHOLD,
+)
 
 
 SYSTEM_PROMPT = (
-    "You are a preventive health AI. Classify citizens as 0 (standard monitoring) "
-    "or 1 (needs preventive support). "
-    "Respond ONLY with JSON: {\"CITIZENID\": 0_or_1, ...}. No other text."
+    "Preventive health classifier. Rule: if a citizen has escalated care events "
+    "(specialist/follow-up/emergency) AND declining physical activity AND rising "
+    "environmental exposure → label 1. Otherwise → label 0. "
+    "Respond ONLY with compact JSON: {\"ID\":0,...}. Zero extra text."
 )
 
 
 class WellbeingAnalysisAgent:
     """
-    Uses LLM to classify evaluation citizens using training data as calibration examples.
-    Makes a single batched LLM call to minimize token usage.
-    Tracked via Langfuse v3.
+    Classifies evaluation citizens with minimum token usage:
+    1. Pre-classify all clearly confident cases with rule scores (0 tokens).
+    2. Only call LLM for the ambiguous middle range (rare).
+    3. LLM prompt contains only ambiguous citizens, no training examples.
     """
 
     def __init__(self, tracer=None):
-        self.llm = ChatOpenAI(
-            api_key=OPENROUTER_API_KEY,
-            base_url=BASE_URL,
-            model=MODEL_ID,
-            temperature=TEMPERATURE,
-            max_tokens=MAX_TOKENS,
-        )
+        self._llm = None  # Lazy init — only create if LLM call is actually needed
         self.tracer = tracer
+
+    @property
+    def llm(self):
+        if self._llm is None:
+            self._llm = ChatOpenAI(
+                api_key=OPENROUTER_API_KEY,
+                base_url=BASE_URL,
+                model=MODEL_ID,
+                temperature=TEMPERATURE,
+                max_tokens=MAX_TOKENS,
+            )
+        return self._llm
 
     def run(
         self,
         train_features: Dict[str, CitizenFeatures],
-        train_mobility: Dict[str, MobilityFeatures],
+        train_mobility,
         train_personas: str,
         eval_features: Dict[str, CitizenFeatures],
-        eval_mobility: Dict[str, MobilityFeatures],
+        eval_mobility,
         eval_personas: str,
         rule_predictions: Dict[str, int],
     ) -> Dict[str, int]:
         """
         Returns {citizen_id: 0_or_1} for all evaluation citizens.
-        One batched LLM call for maximum token efficiency.
+        Calls LLM only for citizens with ambiguous rule scores.
         """
-        prompt = self._build_compact_prompt(
-            train_features, train_personas,
-            eval_features, eval_personas,
-            rule_predictions,
-        )
+        confident, ambiguous = self._split_by_confidence(eval_features)
 
+        # Classify confident cases instantly (0 tokens)
+        predictions = dict(confident)
+
+        if not ambiguous:
+            print(f"       [WellbeingAnalysisAgent] All {len(confident)} citizens classified by rules. LLM skipped (0 tokens).")
+            return predictions
+
+        # Only call LLM for ambiguous citizens
+        print(f"       [WellbeingAnalysisAgent] {len(confident)} confident + {len(ambiguous)} ambiguous → calling LLM for {len(ambiguous)} citizens.")
+        ambiguous_features = {cid: eval_features[cid] for cid in ambiguous}
+        ambiguous_personas = _filter_personas(eval_personas, set(ambiguous))
+
+        prompt = _build_minimal_prompt(ambiguous_features, ambiguous_personas)
+        llm_results = self._call_llm(prompt, ambiguous_features)
+
+        predictions.update(llm_results)
+        return predictions
+
+    def _split_by_confidence(
+        self, eval_features: Dict[str, CitizenFeatures]
+    ) -> Tuple[Dict[str, int], List[str]]:
+        """
+        Split citizens into:
+          - confident: {cid: label} classified purely by rule score
+          - ambiguous: [cid] that need LLM judgment
+        """
+        confident = {}
+        ambiguous = []
+        for cid, f in eval_features.items():
+            if f.rule_risk_score >= CONFIDENT_RISK_THRESHOLD:
+                confident[cid] = 1
+            elif f.rule_risk_score <= CONFIDENT_SAFE_THRESHOLD:
+                confident[cid] = 0
+            else:
+                ambiguous.append(cid)
+        return confident, ambiguous
+
+    def _call_llm(
+        self, prompt: str, features: Dict[str, CitizenFeatures]
+    ) -> Dict[str, int]:
         messages = [
             SystemMessage(content=SYSTEM_PROMPT),
             HumanMessage(content=prompt),
         ]
-
         response = self.llm.invoke(messages)
         raw = response.content.strip()
 
-        # Track LLM call in Langfuse
+        # Track in Langfuse
         if self.tracer and raw:
             usage = response.usage_metadata or {}
             self.tracer.track_llm_call(
-                name="wellbeing-classification-llm",
+                name="wellbeing-llm-ambiguous",
                 model=MODEL_ID,
                 prompt=prompt,
                 response=raw,
@@ -86,120 +132,92 @@ class WellbeingAnalysisAgent:
                 output_tokens=usage.get("output_tokens", 0),
             )
 
-        return self._parse_response(raw, eval_features)
+        return _parse_response(raw, features)
 
-    def _build_compact_prompt(
-        self,
-        train_features: Dict[str, CitizenFeatures],
-        train_personas: str,
-        eval_features: Dict[str, CitizenFeatures],
-        eval_personas: str,
-        rule_predictions: Dict[str, int],
-    ) -> str:
-        """Build a compact prompt to minimize tokens while preserving key signals."""
 
-        # Extract key persona signals (condensed to 3 lines max per citizen)
-        train_signals = _extract_risk_signals(train_personas)
-        eval_signals = _extract_risk_signals(eval_personas)
+# ---------------------------------------------------------------------------
+# Prompt builder (minimal — only for ambiguous citizens)
+# ---------------------------------------------------------------------------
 
-        lines = [
-            "## TRAINING EXAMPLES (learn which pattern = label 1)",
-            "",
-            "Key: PAI=PhysicalActivity, SQI=SleepQuality, EEL=EnvExposure, slope=trend",
-            "escalated_events = specialist/follow-up/emergency visits (STRONG risk signal)",
-            "",
-        ]
+def _build_minimal_prompt(
+    features: Dict[str, CitizenFeatures],
+    personas: str,
+) -> str:
+    """
+    Ultra-compact prompt: only ambiguous citizens, only 3 key signals + persona bullets.
+    Format: [ID] esc=N pai_slope=X eel=Y score=Z | health=... social=...
+    """
+    signals = _extract_risk_signals(personas)
+    lines = []
+    for cid, f in features.items():
+        esc_types = ",".join(f.escalated_event_types) or "none"
+        line = (
+            f"[{cid}] esc={f.escalated_event_count}({esc_types}) "
+            f"pai_slope={f.pai_slope:.1f} sqi_slope={f.sqi_slope:.1f} "
+            f"eel={f.eel_mean:.0f}(slope={f.eel_slope:.1f}) "
+            f"score={f.rule_risk_score:.0f}"
+        )
+        sig = signals.get(cid, "")
+        if sig:
+            line += f" | {sig}"
+        lines.append(line)
 
-        for cid, f in train_features.items():
-            signals = train_signals.get(cid, "")
-            lines.append(
-                f"[{cid}] escalated={f.escalated_event_count} types=[{','.join(f.escalated_event_types) or 'none'}] "
-                f"PAI:{f.pai_mean:.0f}(slope={f.pai_slope:.1f}) SQI:{f.sqi_mean:.0f}(slope={f.sqi_slope:.1f}) "
-                f"EEL:{f.eel_mean:.0f}(slope={f.eel_slope:.1f}) "
-                f"recent_PAI={f.pai_recent:.0f} recent_EEL={f.eel_recent:.0f} "
-                f"rule_score={f.rule_risk_score:.0f}"
-            )
-            if signals:
-                lines.append(f"   persona: {signals}")
+    lines.append(f"\nClassify {list(features.keys())} → JSON only")
+    return "\n".join(lines)
 
-        lines += [
-            "",
-            "## EVALUATION CITIZENS (classify these as 0 or 1)",
-            "",
-        ]
 
-        for cid, f in eval_features.items():
-            signals = eval_signals.get(cid, "")
-            lines.append(
-                f"[{cid}] escalated={f.escalated_event_count} types=[{','.join(f.escalated_event_types) or 'none'}] "
-                f"PAI:{f.pai_mean:.0f}(slope={f.pai_slope:.1f}) SQI:{f.sqi_mean:.0f}(slope={f.sqi_slope:.1f}) "
-                f"EEL:{f.eel_mean:.0f}(slope={f.eel_slope:.1f}) "
-                f"recent_PAI={f.pai_recent:.0f} recent_EEL={f.eel_recent:.0f} "
-                f"rule_score={f.rule_risk_score:.0f}"
-            )
-            if signals:
-                lines.append(f"   persona: {signals}")
+def _parse_response(raw: str, features: Dict[str, CitizenFeatures]) -> Dict[str, int]:
+    """Parse LLM JSON response; fall back to rule predictions on failure."""
+    if raw:
+        try:
+            match = re.search(r'\{[^{}]+\}', raw, re.DOTALL)
+            if match:
+                parsed = json.loads(match.group())
+                result = {}
+                for cid in features:
+                    val = parsed.get(cid)
+                    result[cid] = int(val) if val is not None else features[cid].rule_prediction
+                return result
+        except (json.JSONDecodeError, ValueError, AttributeError):
+            pass
 
-        lines += [
-            "",
-            f"Rule-based scores: {rule_predictions}",
-            "",
-            f"Classify: {list(eval_features.keys())}",
-            "Output JSON only: {\"CITIZENID\": 0, ...}",
-        ]
+    print("[WellbeingAnalysisAgent] WARNING: LLM parse failed, using rule fallback.")
+    if raw:
+        print(f"  Raw: {raw[:200]}")
+    return {cid: f.rule_prediction for cid, f in features.items()}
 
-        return "\n".join(lines)
 
-    def _parse_response(self, raw: str, eval_features: Dict[str, CitizenFeatures]) -> Dict[str, int]:
-        """Parse LLM JSON response with fallback to rule-based predictions."""
-        if raw:
-            try:
-                match = re.search(r'\{[^{}]+\}', raw, re.DOTALL)
-                if match:
-                    parsed = json.loads(match.group())
-                    result = {}
-                    for cid in eval_features:
-                        val = parsed.get(cid)
-                        if val is not None:
-                            result[cid] = int(val)
-                        else:
-                            result[cid] = eval_features[cid].rule_prediction
-                    return result
-            except (json.JSONDecodeError, ValueError, AttributeError):
-                pass
-
-        print("[WellbeingAnalysisAgent] WARNING: LLM response empty or unparseable, using rule-based fallback.")
-        if raw:
-            print(f"Raw response (first 200 chars): {raw[:200]}")
-        return {cid: feat.rule_prediction for cid, feat in eval_features.items()}
-
+# ---------------------------------------------------------------------------
+# Persona helpers
+# ---------------------------------------------------------------------------
 
 def _extract_risk_signals(personas_text: str) -> Dict[str, str]:
-    """
-    Extract the **Mobility**, **Health behavior**, **Social pattern** summary lines
-    from each persona section. These are the most token-efficient risk signal lines.
-    """
+    """Extract **Health behavior** and **Social pattern** bullet lines only."""
     signals = {}
-    parts = personas_text.split("\n## ")
-    for part in parts[1:]:
+    for part in personas_text.split("\n## ")[1:]:
         lines = part.strip().split("\n")
         if not lines:
             continue
-        header = lines[0]
-        cid_match = re.match(r'^([A-Z]{8})', header)
-        if not cid_match:
+        m = re.match(r'^([A-Z]{8})', lines[0])
+        if not m:
             continue
-        cid = cid_match.group(1)
-
-        # Extract bold summary lines and first sentence of narrative
-        key_parts = []
+        cid = m.group(1)
+        parts = []
         for line in lines[1:]:
             if line.startswith("**Health behavior:**"):
-                key_parts.append(line.replace("**Health behavior:** ", "health="))
+                parts.append("health=" + line.split(":**", 1)[1].strip())
             elif line.startswith("**Social pattern:**"):
-                key_parts.append(line.replace("**Social pattern:** ", "social="))
-            elif line.startswith("**Mobility:**"):
-                key_parts.append(line.replace("**Mobility:** ", "mobility="))
-        signals[cid] = " | ".join(key_parts)
-
+                parts.append("social=" + line.split(":**", 1)[1].strip())
+        signals[cid] = " | ".join(parts)
     return signals
+
+
+def _filter_personas(personas_text: str, citizen_ids: set) -> str:
+    """Return persona text containing only the specified citizen IDs."""
+    header = personas_text.split("\n## ")[0]
+    sections = []
+    for part in personas_text.split("\n## ")[1:]:
+        m = re.match(r'^([A-Z]{8})', part.strip())
+        if m and m.group(1) in citizen_ids:
+            sections.append("## " + part)
+    return header + "\n" + "\n".join(sections)

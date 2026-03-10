@@ -25,6 +25,11 @@ _in_evaluation = DATA_DIR / "evaluation" / _data_folder
 EVAL_DIR = _in_training if _in_training.exists() else _in_evaluation
 OUTPUT_DIR = BASE_DIR / "output"
 
+# Confidence thresholds for skipping LLM call
+# Citizens outside this range are classified by rule alone (0 tokens used)
+CONFIDENT_RISK_THRESHOLD = 65   # rule_score >= this → label=1, no LLM needed
+CONFIDENT_SAFE_THRESHOLD = 20   # rule_score <= this → label=0, no LLM needed
+
 # High-risk event types (signals escalating care needs)
 ESCALATED_EVENT_TYPES = {
     "specialist consultation",
